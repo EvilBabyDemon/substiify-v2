@@ -8,7 +8,6 @@ import aiohttp
 import discord
 from bs4 import BeautifulSoup, Tag
 from discord.ext import commands, tasks
-from playwright.async_api import async_playwright
 
 import core
 
@@ -182,16 +181,12 @@ class Gog(Platform):
 			return []
 
 		free_game = GogGame(freegame_tag)
-		game_link = f"https://www.gog.com/en/games?query={free_game.title}&order=desc:score"
 		html_query_page = None
 
 		try:
-			async with async_playwright() as p:
-				browser = await p.chromium.launch()
-				page = await browser.new_page()
-				await page.goto(game_link)
-				await page.wait_for_selector("filterClearingItemLabel")
-				html_query_page = await page.content()
+			async with aiohttp.ClientSession() as session:
+				async with session.get(free_game.store_link) as response:
+					html_query_page = await response.text()
 		except Exception as ex:
 			logger.error(f"Error while getting GOG game page: {ex}")
 
@@ -199,10 +194,9 @@ class Gog(Platform):
 			return current_free_games
 
 		soup_additional = BeautifulSoup(html_query_page, "html.parser")
-		header = soup_additional.find("h1", class_="page-header").text
-
-		if "Showing 1" in header:
-			free_game.set_additional_info(soup_additional.find("product-tile"))
+		banner = soup_additional.find("meta", property="og:image").attrs["content"]
+		if banner:
+			free_game.cover_image_url = banner
 
 		current_free_games.append(free_game)
 		return current_free_games
@@ -369,7 +363,10 @@ class FreeGames(commands.Cog):
 	def _create_game_embed(self, game: Game) -> discord.Embed:
 		embed = discord.Embed(title=game.title, url=game.store_link, color=core.constants.SECONDARY_COLOR)
 		date_timestamp = discord.utils.format_dt(game.end_date, "d")
-		embed.description = f"~~{game.original_price}~~ **{game.discount_price}** until {date_timestamp}"
+		if game.original_price:
+			embed.description = f"~~{game.original_price}~~ **{game.discount_price}** until {date_timestamp}"
+		else:
+			embed.description = f"**{game.discount_price}** until {date_timestamp}"
 		embed.set_thumbnail(url=game.platform.logo_path)
 		embed.set_image(url=game.cover_image_url)
 		return embed

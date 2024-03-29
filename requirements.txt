@@ -8,5 +8,4 @@ colorlog
 psutil
 wavelink
 matplotlib
-pytest-playwright
 #jishaku  # for debugging, not needed for normal use
