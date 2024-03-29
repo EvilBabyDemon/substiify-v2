@@ -6,7 +6,9 @@ from datetime import datetime, timedelta
 
 import aiohttp
 import discord
+from bs4 import BeautifulSoup, Tag
 from discord.ext import commands, tasks
+from playwright.async_api import async_playwright
 
 import core
 
@@ -81,6 +83,40 @@ class EpicGamesGame(Game):
 		return key_images[0]["url"]
 
 
+class GogGame(Game):
+	def __init__(self, game_html: Tag) -> None:
+		self.title: str = self._create_title(game_html)
+		self.start_date: datetime = datetime.now()
+		self.end_date: datetime = self._calculate_end_date(game_html.find("gog-countdown-timer"))
+		self.original_price: str = None
+		self.discount_price: str = "Free"
+		self.cover_image_url: str = None
+		self.store_link: str = self._create_store_link(game_html)
+		self.platform: Platform = Gog
+
+	def _create_title(self, game_html: Tag) -> str:
+		proper_element = game_html.find("div", {"ng-if": "!giveaway.wasMarketingConsentGiven"})
+		title_element = proper_element.find("span", class_="giveaway-banner__title")
+		cleaned_title = title_element.text.replace("Claim ", "").strip()
+		return cleaned_title
+
+	def _calculate_end_date(self, gog_countdown_tag: Tag):
+		end_date_timestamp = int(gog_countdown_tag.attrs["end-date"])
+		# check if the timestamp is in milliseconds
+		if len(str(end_date_timestamp)) > 10:
+			end_date_timestamp = end_date_timestamp // 1000
+		return datetime.fromtimestamp(end_date_timestamp)
+
+	def _create_store_link(self, game_html: Tag) -> str:
+		gog_url = "https://www.gog.com"
+		game_link = game_html.attrs["ng-href"]
+		return f"{gog_url}{game_link}"
+
+	def set_additional_info(self, product_title: Tag) -> None:
+		self.original_price = product_title.find("span", class_="base-value").text
+		self.cover_image_url = product_title.find("picture").find("source").attrs["srcset"]
+
+
 class EpicGames(Platform):
 	api_url: str = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions"
 	logo_path: str = "https://media.discordapp.net/attachments/1073161276802482196/1073161428804055140/epic.png"
@@ -121,8 +157,60 @@ class EpicGames(Platform):
 		return current_free_games
 
 
+class Gog(Platform):
+	api_url: str = "https://www.gog.com/en"
+	logo_path: str = "https://avatars.githubusercontent.com/u/6595318"
+	name: str = "gog"
+
+	@staticmethod
+	async def get_free_games() -> list[Game]:
+		"""
+		Get all free games from GOG
+		"""
+		current_free_games: list[Game] = []
+		try:
+			async with aiohttp.ClientSession() as session:
+				async with session.get(Gog.api_url) as response:
+					html_pront_page = await response.text()
+
+		except Exception as ex:
+			logger.error(f"Error while getting list of all GOG games: {ex}")
+
+		soup = BeautifulSoup(html_pront_page, "html.parser")
+		freegame_tag = soup.find("a", id="giveaway")
+		if not freegame_tag:
+			return []
+
+		free_game = GogGame(freegame_tag)
+		game_link = f"https://www.gog.com/en/games?query={free_game.title}&order=desc:score"
+		html_query_page = None
+
+		try:
+			async with async_playwright() as p:
+				browser = await p.chromium.launch()
+				page = await browser.new_page()
+				await page.goto(game_link)
+				await page.wait_for_selector("filterClearingItemLabel")
+				html_query_page = await page.content()
+		except Exception as ex:
+			logger.error(f"Error while getting GOG game page: {ex}")
+
+		if not html_query_page:
+			return current_free_games
+
+		soup_additional = BeautifulSoup(html_query_page, "html.parser")
+		header = soup_additional.find("h1", class_="page-header").text
+
+		if "Showing 1" in header:
+			free_game.set_additional_info(soup_additional.find("product-tile"))
+
+		current_free_games.append(free_game)
+		return current_free_games
+
+
 STORES = {
-	"epicgames": EpicGames,
+	EpicGames.name: EpicGames,
+	Gog.name: Gog,
 }
 
 
@@ -242,28 +330,36 @@ class FreeGames(commands.Cog):
 
 	@freegames.command()
 	@commands.cooldown(2, 30)
-	async def send(self, ctx: commands.Context, platform: str = None):
+	async def send(self, ctx: commands.Context, platform_str: str = None):
 		"""
 		Show all free games that are currently available.
 		`:param platform:` The platform to get the free games from. If not specified, all platforms will be checked.
 		Valid platforms are: `epicgames`. More platforms will be added in the future.
 		"""
-		platforms: list[Platform] = Platform.__subclasses__()
-		if any(platform == platform.__name__.lower() for platform in platforms):
-			platforms = [platform]
+		platforms: list[Platform] = []
+		if platform_str:
+			platform = STORES.get(platform_str)
+			if not platform:
+				embed = discord.Embed(color=discord.Colour.dark_red())
+				embed.description = f"Invalid platform. Valid platforms are: {', '.join(STORES.keys())}"
+				return await ctx.send(embed=embed)
+			platforms.append(platform)
+		else:
+			platforms = Platform.__subclasses__()
 
 		total_free_games_count = 0
-		for platform in platforms:
-			platform: Platform
-			current_free_games: list[Game] = await platform.get_free_games()
-			total_free_games_count += len(current_free_games)
+		async with ctx.typing():
+			for platform in platforms:
+				platform: Platform
+				current_free_games: list[Game] = await platform.get_free_games()
+				total_free_games_count += len(current_free_games)
 
-			for game in current_free_games:
-				try:
-					embed = self._create_game_embed(game)
-					await ctx.send(embed=embed)
-				except Exception as ex:
-					logger.error(f"Fail while sending free game: {ex}")
+				for game in current_free_games:
+					try:
+						embed = self._create_game_embed(game)
+						await ctx.send(embed=embed)
+					except Exception as ex:
+						logger.error(f"Fail while sending free game: {ex}")
 
 		if total_free_games_count == 0:
 			embed = discord.Embed(color=discord.Colour.dark_embed())
